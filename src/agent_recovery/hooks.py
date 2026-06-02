@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from .core import ProjectRecovery
+from .core import ProjectRecovery, _SYSTEM_MSG_PREFIXES
 
 
 def create_hooks(recovery: ProjectRecovery) -> Dict[str, Callable]:
@@ -33,11 +33,16 @@ def create_hooks(recovery: ProjectRecovery) -> Dict[str, Callable]:
     
     # Track injection state
     _injected_this_session = False
+    # Track user messages for session summary
+    _session_user_messages: List[str] = []
+    _last_user_msg: str = ""
     
     def on_session_start(session_id: str, **kwargs) -> None:
         """Called when a new session starts."""
-        nonlocal _injected_this_session
+        nonlocal _injected_this_session, _session_user_messages, _last_user_msg
         _injected_this_session = False
+        _session_user_messages = []
+        _last_user_msg = ""
         recovery.record_session_start(session_id)
     
     def post_tool_call(
@@ -56,14 +61,38 @@ def create_hooks(recovery: ProjectRecovery) -> Dict[str, Callable]:
     
     def pre_llm_call(
         messages: List[Dict[str, Any]],
+        user_message: Optional[str] = None,
         **kwargs,
     ) -> Optional[Dict[str, str]]:
         """
         Called before every LLM API call.
         
+        Extracts and tracks user messages for session summary.
         Returns context dict to inject, or None.
         """
-        nonlocal _injected_this_session
+        nonlocal _injected_this_session, _session_user_messages, _last_user_msg
+        
+        # Extract last user message
+        user_msg = user_message or ""
+        if not user_msg and messages:
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    user_msg = msg.get("content", "")
+                    if isinstance(user_msg, list):
+                        # Multi-part message
+                        user_msg = " ".join(
+                            p.get("text", "") for p in user_msg
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        )
+                    break
+        
+        # Track user messages (filter system messages, deduplicate)
+        if user_msg and user_msg != _last_user_msg and len(user_msg) > 5:
+            _last_user_msg = user_msg
+            if not user_msg.startswith(_SYSTEM_MSG_PREFIXES):
+                _session_user_messages.append(user_msg[:200])
+                if len(_session_user_messages) > 5:
+                    _session_user_messages.pop(0)
         
         # Only inject once per session
         if _injected_this_session:
@@ -77,7 +106,7 @@ def create_hooks(recovery: ProjectRecovery) -> Dict[str, Callable]:
         summary = recovery.generate_recovery_summary()
         
         # Only inject if there's meaningful content
-        if not summary or "Current:" not in summary:
+        if not summary or len(summary) < 50:
             return None
         
         _injected_this_session = True
@@ -88,8 +117,12 @@ def create_hooks(recovery: ProjectRecovery) -> Dict[str, Callable]:
         completed: bool = True,
         **kwargs,
     ) -> None:
-        """Called when session ends."""
-        recovery.record_session_end(session_id, completed)
+        """Called when session ends. Passes tracked user messages."""
+        recovery.record_session_end(
+            session_id,
+            completed=completed,
+            user_messages=_session_user_messages[-5:] if _session_user_messages else None,
+        )
     
     return {
         "on_session_start": on_session_start,
@@ -144,10 +177,14 @@ class HermesIntegration:
         self.recovery = ProjectRecovery(state_path)
         self.hooks = create_hooks(self.recovery)
         self._recovery_injected = False
+        self._session_user_messages: List[str] = []
+        self._last_user_msg: str = ""
     
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Hermes on_session_start hook."""
         self._recovery_injected = False
+        self._session_user_messages = []
+        self._last_user_msg = ""
         self.hooks["on_session_start"](session_id, **kwargs)
     
     def post_tool_call(
@@ -163,17 +200,39 @@ class HermesIntegration:
     def pre_llm_call(
         self,
         messages: List[Dict[str, Any]],
+        user_message: Optional[str] = None,
         **kwargs,
     ) -> Optional[Dict[str, str]]:
         """
         Hermes pre_llm_call hook.
         
+        Extracts user messages for tracking, filters system messages.
         Returns context dict for injection, or None.
         """
+        # Extract and track user message
+        user_msg = user_message or ""
+        if not user_msg and messages:
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    user_msg = msg.get("content", "")
+                    if isinstance(user_msg, list):
+                        user_msg = " ".join(
+                            p.get("text", "") for p in user_msg
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        )
+                    break
+        
+        if user_msg and user_msg != self._last_user_msg and len(user_msg) > 5:
+            self._last_user_msg = user_msg
+            if not user_msg.startswith(_SYSTEM_MSG_PREFIXES):
+                self._session_user_messages.append(user_msg[:200])
+                if len(self._session_user_messages) > 5:
+                    self._session_user_messages.pop(0)
+        
         if self._recovery_injected:
             return None
         
-        result = self.hooks["pre_llm_call"](messages, **kwargs)
+        result = self.hooks["pre_llm_call"](messages, user_message=user_message, **kwargs)
         if result:
             self._recovery_injected = True
         return result
@@ -184,8 +243,12 @@ class HermesIntegration:
         completed: bool = True,
         **kwargs,
     ) -> None:
-        """Hermes on_session_end hook."""
-        self.hooks["on_session_end"](session_id, completed, **kwargs)
+        """Hermes on_session_end hook. Passes tracked user messages."""
+        self.recovery.record_session_end(
+            session_id,
+            completed=completed,
+            user_messages=self._session_user_messages[-5:] if self._session_user_messages else None,
+        )
 
 
 class ClaudeCodeIntegration:
@@ -228,7 +291,7 @@ class ClaudeCodeIntegration:
             return None
         
         summary = self.recovery.generate_recovery_summary()
-        if summary and "Current:" in summary:
+        if summary and len(summary) > 50:
             return summary
         return None
     
