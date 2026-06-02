@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-06-03
+
+### Added
+
+- **User message tracking**: `record_session_end` now accepts `user_messages` parameter to store what the user said during the session
+- **`last_session` state**: Top-level state field for instant recovery context — shows what the user was asking about
+- **`current_session` tracking**: `record_session_start` now writes `current_session` to state
+- **System message filtering**: Auto-generated messages (e.g., "Review the conversation above...") are filtered from `user_messages` at both the hook layer and the core layer
+- **YAML-level dedup**: `record_session_end` checks the state file itself (not just in-memory variables) to prevent duplicate `session_ended` events — survives module reloads
+- **Recovery summary improvements**: `generate_recovery_summary` now shows `last_session` with user messages, skips `tool_call` noise, and deduplicates `session_ended` events in the activity timeline
+
+### Changed
+
+- `record_session_end` signature: added optional `user_messages: List[str]` parameter (backward compatible)
+- `generate_recovery_summary` output: more compact, focused on session context rather than tool noise
+- `pre_llm_call` in hooks: now extracts and tracks user messages for session summary
+- `_empty_state`: includes `current_session` and `last_session` fields
+
+### Fixed
+
+- **Duplicate session_ended events**: Module reload (e.g., during hot-fix) would reset the in-memory dedup guard, causing the same session to be recorded multiple times. Fixed with YAML-level dedup.
+- **System messages in user_messages**: Auto-generated hook messages like "Review the conversation above..." were being stored as user messages. Fixed with prefix-based filtering in both hooks and core.
+
+### Design Decisions
+
+- **Dual-layer filtering**: System messages are filtered in both `hooks.py` (pre_llm_call) and `core.py` (record_session_end). Defense in depth — even if one layer misses, the other catches it.
+- **YAML as source of truth for dedup**: In-memory variables are fast but fragile (module reload resets them). The YAML file is slow but durable. We check both.
+- **last_session only written with real messages**: Empty/tool-only sessions don't clobber a meaningful last_session. This prevents recovery context from being wiped by automated sub-sessions.
+
 ## [1.0.0] - 2026-06-02
 
 ### Added
@@ -124,6 +153,12 @@ v1.0: Production Ready
   ✅ Cross-agent compatible data format
   ✅ Thread safety
   ✅ Capacity limits
+
+v1.1: Session Context & Robustness
+  Problem: Recovery summary didn't show what the user was asking about
+  Solution: User message tracking + last_session state + system message filtering
+  Result: Agent knows "what was I doing" without searching chat history
+  Bugfix: YAML-level dedup prevents duplicate events after module reload
 ```
 
 ---
@@ -135,6 +170,7 @@ v1.0: Production Ready
 3. **Latency Reduction**: 99% time reduction (30s → <1s)
 4. **Reliability**: Deterministic state beats probabilistic search
 5. **Simplicity**: YAML file beats vector database
+6. **Robustness**: YAML-level dedup beats in-memory guards
 
 ---
 
@@ -147,3 +183,4 @@ Key contributions from iterative design discussions:
 - GitHub research on similar projects (agentkeeper, Octopoda-OS, etc.)
 - Three rounds of design convergence
 - Critical feedback on B+ architecture, todo binding, and null handling
+- Bug reports on duplicate events and system message leakage
