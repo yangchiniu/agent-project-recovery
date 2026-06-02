@@ -18,6 +18,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+# System message prefixes that should be filtered from user_messages
+# (auto-generated hook messages, not real user input)
+_SYSTEM_MSG_PREFIXES = (
+    "Review the conversation above",
+)
+
+
 class ProjectRecovery:
     """
     Lightweight state persistence for AI agents.
@@ -69,6 +76,8 @@ class ProjectRecovery:
             "version": 1,
             "project": "",
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "current_session": None,
+            "last_session": None,
             "state": {
                 "goal": {"value": None, "source": "none"},
                 "current_task": {"value": None, "source": "none"},
@@ -125,9 +134,10 @@ class ProjectRecovery:
     # ── Public API: Recording ──────────────────────────────────────────────
     
     def record_session_start(self, session_id: str) -> None:
-        """Record session start event."""
+        """Record session start event and track current session."""
         with self._state_lock:
             state = self._read_state()
+            state["current_session"] = session_id
             self._append_event(state, {
                 "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "type": "session_started",
@@ -135,16 +145,68 @@ class ProjectRecovery:
             })
             self._write_state(state)
     
-    def record_session_end(self, session_id: str, completed: bool = True) -> None:
-        """Record session end event."""
+    def record_session_end(
+        self,
+        session_id: str,
+        completed: bool = True,
+        user_messages: Optional[List[str]] = None,
+    ) -> None:
+        """
+        Record session end event with optional user message summary.
+        
+        Includes YAML-level dedup: if last_session or the last session_ended
+        event already has this session_id, the write is skipped. This guards
+        against module reload resetting in-memory dedup state.
+        
+        Args:
+            session_id: Session identifier
+            completed: Whether the session completed normally
+            user_messages: Optional list of user messages from this session
+        """
         with self._state_lock:
             state = self._read_state()
-            self._append_event(state, {
+            
+            # YAML-level dedup: if last_session already has this session_id, skip
+            existing_last = state.get("last_session") or {}
+            if existing_last.get("session_id") == session_id:
+                return
+            
+            # Also check events: if the last session_ended event has this session_id, skip
+            events = state.get("events", [])
+            for e in reversed(events):
+                if e.get("type") == "session_ended":
+                    if e.get("session_id") == session_id:
+                        return
+                    break
+            
+            # Filter system messages from user_messages
+            if user_messages:
+                user_messages = [
+                    m for m in user_messages
+                    if not m.startswith(_SYSTEM_MSG_PREFIXES)
+                ]
+            
+            event = {
                 "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "type": "session_ended",
                 "session_id": session_id,
                 "completed": completed,
-            })
+            }
+            if user_messages:
+                event["user_messages"] = user_messages[-5:]
+            self._append_event(state, event)
+            
+            # Write last_session for quick recovery (only if there are real messages)
+            if user_messages:
+                state["last_session"] = {
+                    "session_id": session_id,
+                    "ended_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "completed": completed,
+                    "user_messages": user_messages[-5:],
+                }
+            
+            # Clear current_session since session is ending
+            state["current_session"] = None
             self._write_state(state)
     
     def record_tool_call(
@@ -256,7 +318,7 @@ class ProjectRecovery:
             path = args.get("path", "")
             if path and path not in artifacts:
                 artifacts.append(path)
-                facts["artifacts"] = artifacts[-self.MAX_ARTIFACTS:]
+                facts["artifacts"] = artifacts[-self.MAX_ARTIFACTS]
         
         # Track commits
         commits = facts.get("commits", [])
@@ -442,6 +504,21 @@ class ProjectRecovery:
             lines.append(f"Branch: {branch}")
         lines.append("")
         
+        # Last session info (for recovery context)
+        cur_sid = state.get("current_session")
+        if cur_sid:
+            lines.append(f"Current session: {cur_sid}")
+        last = state.get("last_session")
+        if last:
+            sid = last.get("session_id", "?")
+            ended = last.get("ended_at", "?")[:19]
+            msgs = last.get("user_messages", [])
+            if msgs:
+                lines.append(f"Last session ({sid}, ended {ended}):")
+                for m in msgs:
+                    lines.append(f"  - {m[:120]}")
+                lines.append("")
+        
         # Facts layer
         f = state.get("facts", {})
         tools = f.get("tools_used", [])[:8]
@@ -457,15 +534,32 @@ class ProjectRecovery:
             lines.append(f"Artifacts: {', '.join(artifacts)}")
         if commits:
             for c in commits:
-                lines.append(f"Commit: {c.get('msg', '?')}")
+                msg = c.get('msg', '?').split('\n')[0][:80]
+                lines.append(f"Commit: {msg}")
         
-        # Recent events (last 5)
+        # Recent events — show session boundaries and explicit state changes,
+        # skip individual tool_call noise (those are already in "Recent tools").
         events = state.get("events", [])
-        recent = events[-5:] if events else []
-        if recent:
+        meaningful = []
+        _seen_end_sessions: set = set()
+        for ev in reversed(events):
+            ev_type = ev.get("type", "")
+            if ev_type == "tool_call":
+                continue  # skip noise — tool names are in "Recent tools" above
+            if ev_type == "session_ended":
+                sid = ev.get("session_id", "")
+                if sid in _seen_end_sessions:
+                    continue  # deduplicate repeated session_ended for same session
+                _seen_end_sessions.add(sid)
+            meaningful.append(ev)
+            if len(meaningful) >= 8:
+                break
+        meaningful.reverse()
+        
+        if meaningful:
             lines.append("")
             lines.append("Recent activity:")
-            for ev in recent:
+            for ev in meaningful:
                 ev_type = ev.get("type", "?")
                 summary = ev.get("summary", "")
                 if not summary:
@@ -474,14 +568,16 @@ class ProjectRecovery:
                     elif ev_type == "session_ended":
                         sid = ev.get("session_id", "?")
                         comp = "completed" if ev.get("completed") else "interrupted"
-                        summary = f"session {sid} ({comp})"
+                        um = ev.get("user_messages", [])
+                        msg_count = len(um) if um else 0
+                        summary = f"session {sid} ({comp}, {msg_count} msgs)"
                     elif ev_type == "explicit_state":
                         field = ev.get("field", "?")
                         val = ev.get("value", "")
                         summary = f"{field} = {val}"
                     else:
                         summary = ev.get("tool", ev_type)
-                at = ev.get("at", "")[:19]  # trim microseconds
+                at = ev.get("at", "")[:19]
                 lines.append(f"  [{at}] {ev_type}: {summary}")
         
         lines.append("")
